@@ -64,8 +64,7 @@ impl TaskScheduler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::common::types::{TaskConfig, TaskStatus};
-    use std::collections::HashMap;
+    use crate::{common::types::{TaskConfig, TaskStatus}, event::EventSystem};
     use uuid::Uuid;
 
     fn create_test_task(is_periodic: bool, interval: &str) -> Arc<Task> {
@@ -78,9 +77,9 @@ mod tests {
             importance: 1,
             dependencies: vec![],
         };
-        let address_map = Arc::new(HashMap::new());
+        // let address_map: Arc<HashMap<String, String>> = Arc::new(HashMap::new());
         let depend = config.dependencies.clone();
-        Arc::new(Task::new(config, address_map, depend))
+        Arc::new(Task::new(config, Arc::new(EventSystem::new()), depend))
     }
 
     #[tokio::test]

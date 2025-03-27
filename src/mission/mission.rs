@@ -1,4 +1,5 @@
-use crate::common::types::{MissionConfig, TaskAddressMap, TaskConfig, TaskInfo};
+use crate::common::types::{MissionConfig, TaskInfo};
+use crate::event::EventSystem;
 use crate::mission::topology::TopologyManager;
 use crate::task::task::Task;
 use crate::utils::error::{NightError, Result};
@@ -6,19 +7,20 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use uuid::Uuid;
+use crate::common::types::TaskStatus;
 
 #[derive(Clone)]
 pub struct Mission {
     pub config: MissionConfig,
     pub topology: Arc<TopologyManager>,
     pub tasks: Arc<RwLock<HashMap<Uuid, Arc<Task>>>>,
-    pub address_map: Arc<TaskAddressMap>,
+    pub event_system: Arc<EventSystem>,
 }
 
 impl Mission {
     pub async fn new(config: MissionConfig) -> Result<Self> {
         let topology = Arc::new(TopologyManager::new(config.tasks.clone())?);
-        let address_map = Arc::new(Self::generate_address_map(&config.tasks)?);
+        let event_system = Arc::new(EventSystem::new());
 
         let mut dependent_tasks_map = HashMap::new();
         for task in &config.tasks {
@@ -38,7 +40,7 @@ impl Mission {
                 .unwrap_or_default();
             let task = Arc::new(Task::new(
                 task_config.clone(),
-                address_map.clone(),
+                event_system.clone(),
                 dependent_tasks,
             ));
             tasks.write().await.insert(task_config.id, task);
@@ -48,29 +50,14 @@ impl Mission {
             config,
             topology,
             tasks,
-            address_map,
+            event_system,
         })
     }
 
-    fn generate_address_map(tasks: &[TaskConfig]) -> Result<TaskAddressMap> {
-        tasks
-            .iter()
-            .enumerate()
-            .map(|(i, task)| Ok((task.id, format!("127.0.0.1:{}", 12000 + i).parse().unwrap())))
-            .collect()
-    }
-
     pub async fn start(&self) -> Result<()> {
-        // Start all tasks listening
-        for (task_id, task) in self.tasks.read().await.iter() {
-            let port = self
-                .address_map
-                .get(task_id)
-                .ok_or_else(|| {
-                    NightError::Mission(format!("No address found for task {}", task_id))
-                })?
-                .port();
-            task.start_listening(port).await?;
+        // 设置所有任务的依赖监听器
+        for (_, task) in self.tasks.read().await.iter() {
+            task.setup_dependency_listeners().await?;
         }
 
         let execution_order = self.topology.get_execution_order();
@@ -116,7 +103,69 @@ impl Mission {
             .cloned()
             .ok_or_else(|| NightError::Mission(format!("Task {} not found", task_id)))?;
 
+        // 设置执行锁为false，阻止任务继续执行
         task.set_execution_lock(false);
+        
+        // 无论任务当前状态如何，都将其设置为Pending状态
+        // 这样可以确保任务不会被标记为Completed
+        task.set_status_external(TaskStatus::Pending).await;
+        println!("Mission: Stopped task {} ({})", task.config.name, task_id);
+        
+        // 递归处理所有依赖于此任务的任务
+        let mut visited = std::collections::HashSet::new();
+        self.mark_dependent_tasks_incomplete(task_id, &mut visited).await?;
+        
+        Ok(())
+    }
+    
+    // 递归地将所有依赖于指定任务的任务标记为不完整
+    async fn mark_dependent_tasks_incomplete(&self, task_id: Uuid, visited: &mut std::collections::HashSet<Uuid>) -> Result<()> {
+        // 防止循环依赖导致的无限递归
+        if visited.contains(&task_id) {
+            return Ok(());
+        }
+        visited.insert(task_id);
+        
+        // 获取任务和依赖任务ID列表
+        let dependent_task_ids;
+        {
+            let tasks_read = self.tasks.read().await;
+            let task = match tasks_read.get(&task_id) {
+                Some(t) => t.clone(),
+                None => return Ok(()), // 任务不存在，直接返回
+            };
+            dependent_task_ids = task.dependent_tasks.clone();
+        } // 读锁在这里被释放
+        
+        // 对于每个依赖于此任务的任务
+        for &dependent_id in dependent_task_ids.iter() {
+            // 为每个依赖任务单独获取读锁
+            let dependent_task_clone;
+            {
+                let tasks_read = self.tasks.read().await;
+                let dependent_task = match tasks_read.get(&dependent_id) {
+                    Some(t) => t.clone(),
+                    None => continue, // 依赖任务不存在，继续下一个
+                };
+                
+                // 将依赖状态设置为false，表示依赖未完成
+                dependent_task.set_dependency_status(task_id, false);
+                println!("Mission: Marked dependency {} as incomplete for task {}", 
+                         task_id, dependent_id);
+                
+                // 将依赖任务的状态设置为Pending，防止它被执行
+                dependent_task.set_execution_lock(false);
+                dependent_task_clone = dependent_task;
+            } // 读锁在这里被释放
+            
+            dependent_task_clone.set_status_external(TaskStatus::Pending).await;
+            println!("Mission: Stopped dependent task {} ({})", dependent_task_clone.config.name, dependent_id);
+            
+            // 递归处理依赖于此依赖任务的任务，使用Box::pin处理递归
+            let future = self.mark_dependent_tasks_incomplete(dependent_id, visited);
+            Box::pin(future).await?
+        }
+        
         Ok(())
     }
 
@@ -140,8 +189,8 @@ impl Mission {
             .collect()
     }
 
-    pub fn get_address_map(&self) -> Arc<TaskAddressMap> {
-        self.address_map.clone()
+    pub fn get_event_system(&self) -> Arc<EventSystem> {
+        self.event_system.clone()
     }
 }
 

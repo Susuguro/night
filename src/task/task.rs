@@ -1,4 +1,5 @@
-use crate::common::types::{TaskAddressMap, TaskConfig, TaskDependencyMap, TaskInfo, TaskStatus};
+use crate::common::types::{TaskConfig, TaskDependencyMap, TaskInfo, TaskStatus};
+use crate::event::{Event, EventSystem, EventType};
 use crate::utils::error::{NightError, Result};
 use chrono::{DateTime, Utc};
 use std::collections::HashMap;
@@ -11,12 +12,10 @@ use std::sync::{
 use tokio::time::{interval, Duration};
 use uuid::Uuid;
 
-use super::communication::TaskCommunicator;
 
 static GLOBAL_EXECUTION_ORDER: AtomicUsize = AtomicUsize::new(0);
 const MAX_RETRY_ATTEMPTS: u32 = 5;
 const RETRY_DELAY: Duration = Duration::from_secs(1);
-const SEND_DELAY: Duration = Duration::from_micros(200);
 
 pub struct Task {
     pub config: TaskConfig,
@@ -25,50 +24,19 @@ pub struct Task {
     pub end_time: Arc<Mutex<Option<DateTime<Utc>>>>,
     pub execution_lock: Arc<AtomicBool>,
     pub dependency_status: Arc<Mutex<TaskDependencyMap>>,
-    pub address_map: Arc<TaskAddressMap>,
     pub execution_order: Arc<Mutex<Option<usize>>>,
-    pub communicator: Arc<TaskCommunicator>,
     pub dependent_tasks: Arc<Vec<Uuid>>,
+    pub event_system: Arc<EventSystem>,
 }
 
 impl Task {
     pub fn new(
         config: TaskConfig,
-        address_map: Arc<TaskAddressMap>,
+        event_system: Arc<EventSystem>,
         dependent_tasks: Vec<Uuid>,
     ) -> Self {
         let dependency_status: Arc<Mutex<HashMap<Uuid, bool>>> = Arc::new(Mutex::new(
             config.dependencies.iter().map(|&id| (id, false)).collect(),
-        ));
-
-        let task_id = config.id;
-        let dependency_handler = {
-            let dependency_status = Arc::clone(&dependency_status);
-            move |completed_task_id| {
-                let dependency_status = Arc::clone(&dependency_status);
-                Box::pin(async move {
-                    let mut dependencies = dependency_status.lock().unwrap();
-                    if let Some(status) = dependencies.get_mut(&completed_task_id) {
-                        *status = true;
-                        println!(
-                            "Task {}: Dependency {} completed",
-                            task_id, completed_task_id
-                        );
-                    } else {
-                        println!(
-                            "Task {}: Received completion for non-dependency task {}",
-                            task_id, completed_task_id
-                        );
-                    }
-                    Ok(())
-                }) as Pin<Box<dyn Future<Output = Result<()>> + Send + Sync>>
-            }
-        };
-
-        let communicator = Arc::new(TaskCommunicator::new(
-            config.id,
-            address_map.clone(),
-            dependency_handler,
         ));
 
         Task {
@@ -77,11 +45,10 @@ impl Task {
             start_time: Arc::new(Mutex::new(None)),
             end_time: Arc::new(Mutex::new(None)),
             execution_lock: Arc::new(AtomicBool::new(true)),
-            dependency_status: dependency_status,
-            address_map,
+            dependency_status,
             execution_order: Arc::new(Mutex::new(None)),
-            communicator,
             dependent_tasks: Arc::new(dependent_tasks),
+            event_system,
         }
     }
 
@@ -106,6 +73,12 @@ impl Task {
             tokio::time::sleep(RETRY_DELAY).await;
         }
 
+        // 检查执行锁，如果为false则不执行任务
+        if !self.execution_lock.load(Ordering::Relaxed) {
+            println!("Task {}: Execution locked, not running", self.config.name);
+            return Ok(());
+        }
+
         let order = GLOBAL_EXECUTION_ORDER.fetch_add(1, Ordering::SeqCst);
 
         if let Ok(mut guard) = self.execution_order.lock() {
@@ -118,6 +91,11 @@ impl Task {
             );
         }
 
+        // 记录任务开始时间
+        if let Ok(mut start_time) = self.start_time.lock() {
+            *start_time = Some(chrono::Utc::now());
+        }
+
         // println!("Task: Starting execution of {}", self.config.name);
         self.set_status(TaskStatus::Running).await;
 
@@ -128,6 +106,11 @@ impl Task {
             self.run_once().await
         };
 
+        // 记录任务结束时间
+        if let Ok(mut end_time) = self.end_time.lock() {
+            *end_time = Some(chrono::Utc::now());
+        }
+
         match &result {
             Ok(_) => {
                 // println!("Task: Successfully completed {}", self.config.name);
@@ -137,9 +120,11 @@ impl Task {
                     self.notify_completion().await?;
                 }
             }
-            Err(_e) => {
-                // println!("Task: Failed to execute {}. Error: {:?}", self.config.name, e);
+            Err(e) => {
+                println!("Task: Failed to execute {}. Error: {:?}", self.config.name, e);
                 self.set_status(TaskStatus::Failed).await;
+                // 失败任务也需要通知依赖它的任务
+                self.notify_completion().await?;
             }
         }
 
@@ -152,8 +137,25 @@ impl Task {
     }
 
     pub async fn run_once(&self) -> Result<()> {
-        // println!("Completed task: {}", self.config.name);
-        self.set_status(TaskStatus::Completed).await;
+        use tokio::process::Command;
+        
+        // 执行任务命令
+        let output = Command::new("sh")
+            .arg("-c")
+            .arg(&self.config.command)
+            .output()
+            .await
+            .map_err(|e| NightError::Task(format!("Failed to execute command: {}", e)))?;
+        
+        // 检查命令执行结果
+        if !output.status.success() {
+            return Err(NightError::Task(format!(
+                "Command '{}' failed with exit code: {}",
+                self.config.command,
+                output.status
+            )));
+        }
+        
         Ok(())
     }
 
@@ -173,39 +175,52 @@ impl Task {
 
     #[allow(dead_code)]
     async fn can_start(&self) -> bool {
+        // 如果没有依赖，可以立即启动
+        if self.dependency_status.lock().unwrap().is_empty() {
+            return true;
+        }
+        
         let dependencies = self.dependency_status.lock().unwrap();
         dependencies.values().all(|&status| status)
     }
 
     async fn set_status(&self, new_status: TaskStatus) {
-        let mut status = self.status.lock().unwrap();
-        *status = new_status;
+        let previous_status;
+        {
+            let mut status = self.status.lock().unwrap();
+            previous_status = *status;
+            *status = new_status;
+        }
+        
+        // 发布任务状态变更事件
+        self.event_system.publish(Event::task_status_changed(
+            self.config.id,
+            previous_status,
+            new_status
+        )).await.ok();
+    }
+    
+    pub async fn set_status_external(&self, new_status: TaskStatus) {
+        self.set_status(new_status).await;
     }
 
     async fn notify_completion(&self) -> Result<()> {
-        for attempt in 1..=MAX_RETRY_ATTEMPTS {
-            match self
-                .communicator
-                .notify_completion(self.dependent_tasks.clone())
-                .await
-            {
-                Ok(_) => return Ok(()),
-                Err(e) => {
-                    if attempt == MAX_RETRY_ATTEMPTS {
-                        return Err(NightError::Communication(format!(
-                            "Failed to notify completion after {} attempts: {}",
-                            MAX_RETRY_ATTEMPTS, e
-                        )));
-                    }
-                    println!(
-                        "Task {}: Failed to notify completion, attempt {}/{}",
-                        self.config.name, attempt, MAX_RETRY_ATTEMPTS
-                    );
-                    tokio::time::sleep(SEND_DELAY).await;
-                }
-            }
+        // 发布任务完成事件
+        let current_status = *self.status.lock().unwrap();
+        match current_status {
+            TaskStatus::Completed => {
+                self.event_system.publish(Event::task_completed(self.config.id)).await?
+            },
+            TaskStatus::Failed => {
+                self.event_system.publish(Event::task_failed(
+                    self.config.id,
+                    format!("Task {} failed", self.config.name)
+                )).await?
+            },
+            _ => {}
         }
-        unreachable!()
+        
+        Ok(())
     }
 
     pub async fn handle_dependency_completion(&self, completed_task_id: Uuid) -> Result<()> {
@@ -224,17 +239,46 @@ impl Task {
         }
         Ok(())
     }
-
-    pub async fn start_listening(&self, port: u16) -> Result<()> {
-        let task_id = self.config.id;
-        let communicator = self.communicator.clone();
-
-        tokio::spawn(async move {
-            if let Err(e) = communicator.start_listener(port).await {
-                eprintln!("Error in task {} listener: {:?}", task_id, e);
-            }
-        });
-
+    
+    pub async fn setup_dependency_listeners(&self) -> Result<()> {
+        // 为每个依赖任务设置完成事件监听器
+        let task_name = self.config.name.clone();
+        let dependency_status = self.dependency_status.clone();
+        
+        for &dep_id in self.config.dependencies.iter() {
+            let dep_status = dependency_status.clone();
+            let task_name = task_name.clone();
+            
+            let callback = Arc::new(move |event: Event| {
+                let dep_status = dep_status.clone();
+                let task_name = task_name.clone();
+                
+                let fut = async move {
+                    if let Some(event_task_id) = event.task_id {
+                        if event_task_id == dep_id {
+                            let mut dependencies = dep_status.lock().unwrap();
+                            if let Some(status) = dependencies.get_mut(&dep_id) {
+                                *status = true;
+                                println!("Task {}: Dependency {} completed", task_name, dep_id);
+                            }
+                        }
+                    }
+                    Ok(())
+                };
+                
+                let boxed: Pin<Box<dyn Future<Output = Result<()>> + Send + Sync>> = Box::pin(fut);
+                boxed
+            });
+            
+            let listener = crate::event::EventListener::new(
+                EventType::TaskCompleted,
+                Some(dep_id),
+                callback
+            );
+            
+            self.event_system.subscribe(listener).await?;
+        }
+        
         Ok(())
     }
 
