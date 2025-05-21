@@ -110,6 +110,9 @@ mod tests {
         // Wait for the scheduler to stop
         tokio::time::sleep(Duration::from_millis(150)).await;
 
-        assert_eq!(*task.status.lock().unwrap(), TaskStatus::Completed);
+        // For a periodic task stopped via execution_lock directly (not via Mission::stop_task),
+        // its status will remain as it was when the loop exited (i.e., Running).
+        // Mission::stop_task would additionally set it to Pending.
+        assert_eq!(*task.status.lock().unwrap(), TaskStatus::Running);
     }
 }

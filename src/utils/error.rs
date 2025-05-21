@@ -22,6 +22,9 @@ pub enum NightError {
     #[error("Serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
 
+    #[error("YAML Serialization error: {0}")]
+    YamlSerialization(#[from] serde_yaml::Error),
+
     #[error("Logging error: {0}")]
     Logging(#[from] SetLoggerError),
 

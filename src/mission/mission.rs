@@ -8,6 +8,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use uuid::Uuid;
 use crate::common::types::TaskStatus;
+use async_recursion::async_recursion;
 
 #[derive(Clone)]
 pub struct Mission {
@@ -59,6 +60,13 @@ impl Mission {
         for (_, task) in self.tasks.read().await.iter() {
             task.setup_dependency_listeners().await?;
         }
+
+        // After setting up all dependency listeners...
+        println!("Mission: Notifying all tasks to perform initial checks.");
+        for (_, task) in self.tasks.read().await.iter() {
+            task.notify_ready.notify_one();
+        }
+        // The existing code that gets execution_order and iterates through levels to spawn tasks should follow.
 
         let execution_order = self.topology.get_execution_order();
 
@@ -119,6 +127,7 @@ impl Mission {
     }
     
     // 递归地将所有依赖于指定任务的任务标记为不完整
+    #[async_recursion]
     async fn mark_dependent_tasks_incomplete(&self, task_id: Uuid, visited: &mut std::collections::HashSet<Uuid>) -> Result<()> {
         // 防止循环依赖导致的无限递归
         if visited.contains(&task_id) {
@@ -161,9 +170,8 @@ impl Mission {
             dependent_task_clone.set_status_external(TaskStatus::Pending).await;
             println!("Mission: Stopped dependent task {} ({})", dependent_task_clone.config.name, dependent_id);
             
-            // 递归处理依赖于此依赖任务的任务，使用Box::pin处理递归
-            let future = self.mark_dependent_tasks_incomplete(dependent_id, visited);
-            Box::pin(future).await?
+            // 递归处理依赖于此依赖任务的任务
+            self.mark_dependent_tasks_incomplete(dependent_id, visited).await?;
         }
         
         Ok(())
