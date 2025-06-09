@@ -30,14 +30,14 @@ impl Mission {
                 dependent_tasks_map
                     .entry(dep_id)
                     .or_insert_with(Vec::new)
-                    .push(task.id);
+                    .push(task.id.expect("Task ID must be present when building dependency map"));
             }
         }
 
         let tasks = Arc::new(RwLock::new(HashMap::new()));
         for task_config in &config.tasks {
             let dependent_tasks = dependent_tasks_map
-                .get(&task_config.id)
+                .get(&task_config.id.expect("Task ID must be present when retrieving dependent tasks"))
                 .cloned()
                 .unwrap_or_default();
             let task = Arc::new(Task::new(
@@ -45,7 +45,7 @@ impl Mission {
                 event_system.clone(),
                 dependent_tasks,
             ));
-            tasks.write().await.insert(task_config.id, task);
+            tasks.write().await.insert(task_config.id.expect("ID should be present after config loading and validation"), task);
         }
 
         Ok(Mission {
@@ -218,7 +218,7 @@ mod tests {
             tasks: vec![
                 TaskConfig {
                     name: "Task 1".to_string(),
-                    id: Uuid::new_v4(),
+                    id: Some(Uuid::new_v4()),
                     command: "echo Task 1".to_string(), // Simple, fast command
                     is_periodic: false,
                     interval: "0".to_string(),
@@ -227,7 +227,7 @@ mod tests {
                 },
                 TaskConfig {
                     name: "Task 2".to_string(),
-                    id: Uuid::new_v4(),
+                    id: Some(Uuid::new_v4()),
                     command: "echo Task 2".to_string(), // Simple, fast command
                     is_periodic: false,
                     interval: "0".to_string(),
@@ -282,7 +282,7 @@ mod tests {
         let config = create_test_config();
         let mission = Mission::new(config).await.unwrap();
 
-        let task_id = mission.config.tasks[0].id;
+        let task_id = mission.config.tasks[0].id.expect("Test task should have an ID");
         let result = mission.stop_task(task_id).await;
         assert!(result.is_ok());
 

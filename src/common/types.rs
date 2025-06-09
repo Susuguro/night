@@ -7,7 +7,7 @@ use uuid::Uuid;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskConfig {
     pub name: String,
-    pub id: Uuid,
+    pub id: Option<Uuid>,
     pub command: String,
     pub is_periodic: bool,
     pub interval: String,

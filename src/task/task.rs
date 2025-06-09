@@ -198,14 +198,14 @@ impl Task {
                 Ok(_) => {
                     // println!("Task {}: Periodic run_once completed successfully.", self.config.name); // Can be noisy
                     // Notify completion after each successful run_once for periodic tasks
-                    self.event_system.publish(Event::task_completed(self.config.id)).await?;
+                    self.event_system.publish(Event::task_completed(self.config.id.expect("Task ID should be present after config loading"))).await?;
                 }
                 Err(e) => {
                     // Log the error and continue the loop
                     println!("Task {}: Error in periodic run_once: {:?}. Continuing.", self.config.name, e);
                     // Also publish a failure event for this cycle
                     self.event_system.publish(Event::task_failed(
-                        self.config.id,
+                        self.config.id.expect("Task ID should be present after config loading"),
                         format!("Periodic cycle failed: {:?}", e)
                     )).await?;
                 }
@@ -253,7 +253,7 @@ impl Task {
         
         // 发布任务状态变更事件
         self.event_system.publish(Event::task_status_changed(
-            self.config.id,
+            self.config.id.expect("Task ID should be present after config loading"),
             previous_status,
             new_status
         )).await.ok();
@@ -268,11 +268,11 @@ impl Task {
         let current_status = *self.status.lock().unwrap();
         match current_status {
             TaskStatus::Completed => {
-                self.event_system.publish(Event::task_completed(self.config.id)).await?
+                self.event_system.publish(Event::task_completed(self.config.id.expect("Task ID should be present after config loading"))).await?
             },
             TaskStatus::Failed => {
                 self.event_system.publish(Event::task_failed(
-                    self.config.id,
+                    self.config.id.expect("Task ID should be present after config loading"),
                     format!("Task {} failed", self.config.name)
                 )).await?
             },
@@ -303,7 +303,7 @@ impl Task {
     // }
 
     pub async fn setup_dependency_listeners(&self) -> Result<()> {
-        let task_id = self.config.id; // For logging/identification if needed inside callback
+        let task_id = self.config.id.expect("Task ID should be present after config loading"); // For logging/identification if needed inside callback
         let task_name = self.config.name.clone();
         let dependency_status_arc = self.dependency_status.clone();
         let notify_ready_arc = self.notify_ready.clone();
@@ -395,7 +395,7 @@ impl Task {
 
     pub fn get_info(&self) -> TaskInfo {
         TaskInfo {
-            id: self.config.id,
+            id: self.config.id.expect("Task ID should be present after config loading"),
             status: *self.status.lock().unwrap(),
             start_time: *self.start_time.lock().unwrap(),
             end_time: *self.end_time.lock().unwrap(),
