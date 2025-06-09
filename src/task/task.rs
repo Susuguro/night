@@ -1,4 +1,4 @@
-use crate::common::types::{TaskConfig, TaskDependencyMap, TaskInfo, TaskStatus};
+use crate::common::types::{DependencyState, TaskConfig, TaskDependencyMap, TaskInfo, TaskStatus};
 use crate::event::{Event, EventSystem, EventType};
 use crate::utils::error::{NightError, Result};
 use chrono::{DateTime, Utc};
@@ -35,8 +35,12 @@ impl Task {
         event_system: Arc<EventSystem>,
         dependent_tasks: Vec<Uuid>,
     ) -> Self {
-        let dependency_status: Arc<Mutex<HashMap<Uuid, bool>>> = Arc::new(Mutex::new(
-            config.dependencies.iter().map(|&id| (id, false)).collect(),
+        let dependency_status: Arc<Mutex<TaskDependencyMap>> = Arc::new(Mutex::new(
+            config
+                .dependencies
+                .iter()
+                .map(|&id| (id, DependencyState::Pending))
+                .collect(),
         ));
 
         Task {
@@ -216,9 +220,27 @@ impl Task {
         if self.dependency_status.lock().unwrap().is_empty() {
             return true;
         }
-        
+
         let dependencies = self.dependency_status.lock().unwrap();
-        dependencies.values().all(|&status| status)
+        // Check if any dependency has failed
+        if dependencies
+            .values()
+            .any(|&state| state == DependencyState::Failed)
+        {
+            // If a task has a failed dependency, it should not start and its status should reflect this.
+            // Consider setting self.status to TaskStatus::Failed or a new specific status here.
+            // For now, just preventing start is the primary goal.
+            // The run loop will keep it in Pending, or it might be set to Failed by another mechanism.
+            println!(
+                "Task {}: Cannot start due to a failed dependency.",
+                self.config.name
+            );
+            return false;
+        }
+        // Otherwise, all dependencies must be Completed to start
+        dependencies
+            .values()
+            .all(|&state| state == DependencyState::Completed)
     }
 
     async fn set_status(&self, new_status: TaskStatus) {
@@ -260,75 +282,104 @@ impl Task {
         Ok(())
     }
 
-    pub async fn handle_dependency_completion(&self, completed_task_id: Uuid) -> Result<()> {
-        let mut dependencies = self.dependency_status.lock().unwrap();
-        if let Some(status) = dependencies.get_mut(&completed_task_id) {
-            *status = true;
-            println!(
-                "Task {}: Dependency {} completed",
-                self.config.name, completed_task_id
-            );
-        } else {
-            println!(
-                "Task {}: Received completion for non-dependency task {}",
-                self.config.name, completed_task_id
-            );
-        }
-        Ok(())
-    }
-    
+    // This method might be redundant if setup_dependency_listeners handles all state changes.
+    // For now, let's assume it's not the primary path for dependency failure handling.
+    // If it were to be used, it would need to accept DependencyState.
+    // pub async fn handle_dependency_update(&self, dependency_id: Uuid, new_state: DependencyState) -> Result<()> {
+    //     let mut dependencies = self.dependency_status.lock().unwrap();
+    //     if let Some(status) = dependencies.get_mut(&dependency_id) {
+    //         *status = new_state;
+    //         println!(
+    //             "Task {}: Dependency {} updated to {:?}",
+    //             self.config.name, dependency_id, new_state
+    //         );
+    //     } else {
+    //         println!(
+    //             "Task {}: Received update for non-dependency task {}",
+    //             self.config.name, dependency_id
+    //         );
+    //     }
+    //     Ok(())
+    // }
+
     pub async fn setup_dependency_listeners(&self) -> Result<()> {
-        // 为每个依赖任务设置完成事件监听器
+        let task_id = self.config.id; // For logging/identification if needed inside callback
         let task_name = self.config.name.clone();
-        let dependency_status = self.dependency_status.clone();
-        let notify_ready_clone = self.notify_ready.clone(); // Clone Arc<Notify> for the callback
-        
+        let dependency_status_arc = self.dependency_status.clone();
+        let notify_ready_arc = self.notify_ready.clone();
+        // let status_arc = self.status.clone(); // To set self status to Failed/Blocked
+
         for &dep_id in self.config.dependencies.iter() {
-            let dep_status_inner = dependency_status.clone();
-            let task_name_inner = task_name.clone();
-            let notify_ready_inner = notify_ready_clone.clone(); // Clone Arc<Notify> for each listener
-            
-            let callback = Arc::new(move |event: Event| {
-                let dep_status_cb = dep_status_inner.clone();
-                let task_name_cb = task_name_inner.clone();
-                let notify_ready_cb = notify_ready_inner.clone();
-                
-                let fut = async move {
-                    if let Some(event_task_id) = event.task_id {
-                        if event_task_id == dep_id {
-                            let mut dependencies = dep_status_cb.lock().unwrap();
-                            if let Some(status) = dependencies.get_mut(&dep_id) {
-                                if !*status { // Only update and notify if status was false
-                                    *status = true;
-                                    println!("Task {}: Dependency {} completed", task_name_cb, dep_id);
-                                    notify_ready_cb.notify_one(); // Notify the task to re-check dependencies
+            let dep_status_clone = dependency_status_arc.clone();
+            let notify_clone = notify_ready_arc.clone();
+            let task_name_clone = task_name.clone();
+            // let self_status_clone = status_arc.clone();
+            // let event_system_clone = self.event_system.clone(); // For publishing status change
+
+            let callback = Arc::new(
+                move |event: Event| -> Pin<Box<dyn Future<Output = Result<()>> + Send + Sync>> {
+                    let dep_status_cb = dep_status_clone.clone();
+                    let notify_cb = notify_clone.clone();
+                    let tn_cb = task_name_clone.clone();
+                    // let own_status_cb = self_status_clone.clone();
+                    // let es_cb = event_system_clone.clone();
+
+                    Box::pin(async move {
+                        if let Some(event_task_id) = event.task_id {
+                            if event_task_id == dep_id {
+                                let mut dependencies = dep_status_cb.lock().unwrap();
+                                if let Some(current_dep_state) = dependencies.get_mut(&dep_id) {
+                                    let new_dep_state = match event.event_type {
+                                        EventType::TaskCompleted => DependencyState::Completed,
+                                        EventType::TaskFailed => DependencyState::Failed,
+                                        _ => return Ok(()), // Should not happen with current subscriptions
+                                    };
+
+                                    if *current_dep_state != new_dep_state {
+                                        println!(
+                                            "Task {}: Dependency {} transitioned to {:?}. Previous: {:?}",
+                                            tn_cb, dep_id, new_dep_state, *current_dep_state
+                                        );
+                                        *current_dep_state = new_dep_state;
+
+                                        // If a dependency fails, the current task itself is effectively blocked.
+                                        // It should not run. The `can_start` check will handle this.
+                                        // We might also want to change the task's own status here.
+                                        // For example, if new_dep_state is Failed:
+                                        // let mut current_task_status = own_status_cb.lock().unwrap();
+                                        // if *current_task_status != TaskStatus::Failed && *current_task_status != TaskStatus::Completed {
+                                        //     println!("Task {}: Moving to Pending/Blocked due to failed dependency {}", tn_cb, dep_id);
+                                        //     // Or a new state like TaskStatus::BlockedByDependency
+                                        //     // For now, let run() loop keep it Pending, can_start will prevent execution.
+                                        // }
+                                    }
+                                    // Always notify, so can_start() is re-evaluated.
+                                    // can_start() will then determine if it *actually* can proceed.
+                                    notify_cb.notify_one();
                                 }
                             }
                         }
-                    }
-                    Ok(())
-                };
-                
-                let boxed: Pin<Box<dyn Future<Output = Result<()>> + Send + Sync>> = Box::pin(fut);
-                boxed
-            });
-            
-            // Listen for both TaskCompleted and TaskFailed events from dependencies
-            let listener_completed = crate::event::EventListener::new(
-                EventType::TaskCompleted,
-                Some(dep_id),
-                callback.clone() // Clone Arc for the new listener
+                        Ok(())
+                    })
+                },
             );
-            self.event_system.subscribe(listener_completed).await?;
 
-            let listener_failed = crate::event::EventListener::new(
-                EventType::TaskFailed, // Also listen for TaskFailed
-                Some(dep_id),
-                callback // Use the same callback logic
-            );
-            self.event_system.subscribe(listener_failed).await?;
+            self.event_system
+                .subscribe(crate::event::EventListener::new(
+                    EventType::TaskCompleted,
+                    Some(dep_id),
+                    callback.clone(),
+                ))
+                .await?;
+
+            self.event_system
+                .subscribe(crate::event::EventListener::new(
+                    EventType::TaskFailed,
+                    Some(dep_id),
+                    callback, // Same callback, it internally distinguishes by event.event_type
+                ))
+                .await?;
         }
-        
         Ok(())
     }
 
@@ -352,10 +403,11 @@ impl Task {
         }
     }
 
-    pub fn set_dependency_status(&self, dependency_id: Uuid, status: bool) {
+    // Updated to accept DependencyState
+    pub fn set_dependency_status(&self, dependency_id: Uuid, state: DependencyState) {
         let mut dependencies = self.dependency_status.lock().unwrap();
         if let Some(dep_status) = dependencies.get_mut(&dependency_id) {
-            *dep_status = status;
+            *dep_status = state;
         }
     }
 

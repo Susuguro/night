@@ -1,6 +1,7 @@
 use crate::common::types::{MissionConfig, TaskInfo};
 use crate::event::EventSystem;
 use crate::mission::topology::TopologyManager;
+use crate::common::types::DependencyState;
 use crate::task::task::Task;
 use crate::utils::error::{NightError, Result};
 use std::collections::HashMap;
@@ -161,7 +162,7 @@ impl Mission {
                 };
                 
                 // 将依赖状态设置为false，表示依赖未完成
-                dependent_task.set_dependency_status(task_id, false);
+                dependent_task.set_dependency_status(task_id, DependencyState::Pending);
                 println!("Mission: Marked dependency {} as incomplete for task {}", 
                          task_id, dependent_id);
                 
