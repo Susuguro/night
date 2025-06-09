@@ -9,6 +9,9 @@ use tokio;
 use tokio::time::Duration;
 use uuid::Uuid;
 
+mod task;
+mod mission;
+
 // ===== Test Fixtures =====
 
 /// A test fixture for mission tests
