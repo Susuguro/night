@@ -38,6 +38,13 @@ pub struct TaskInfo {
     pub execution_order: Option<usize>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DependencyState {
+    Pending,
+    Completed,
+    Failed,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskCommunication {
     pub sender_id: Uuid,
@@ -46,5 +53,5 @@ pub struct TaskCommunication {
     pub payload: String,
 }
 
-pub type TaskDependencyMap = HashMap<Uuid, bool>;
+pub type TaskDependencyMap = HashMap<Uuid, DependencyState>;
 pub type TaskAddressMap = HashMap<Uuid, SocketAddr>;

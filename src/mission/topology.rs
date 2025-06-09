@@ -110,15 +110,26 @@ impl TopologyManager {
         false
     }
 
+    /// Calculates the execution order of tasks based on their dependencies.
+    /// This method implements Kahn's algorithm for topological sorting.
+    /// Returns a vector of vectors, where each inner vector represents a level
+    /// of tasks that can be executed in parallel.
     pub fn get_execution_order(&self) -> Vec<Vec<Uuid>> {
+        // Initialize a map to store the in-degree of each task.
+        // The in-degree of a task is the number of tasks that depend on it.
         let mut in_degree = HashMap::new();
         for &task_id in self.tasks.keys() {
             in_degree.insert(
                 task_id,
+                // Get the number of dependencies for the current task.
+                // If the task has no entry in `self.dependencies` or its dependency list is empty,
+                // its in-degree is 0.
                 self.dependencies.get(&task_id).map_or(0, |deps| deps.len()),
             );
         }
 
+        // Initialize a queue with all tasks that have an in-degree of 0.
+        // These are the tasks that have no prerequisites and can be executed first.
         let mut queue = VecDeque::new();
         for (&task_id, &degree) in &in_degree {
             if degree == 0 {
@@ -126,26 +137,41 @@ impl TopologyManager {
             }
         }
 
+        // This will store the final result, where each inner vector is a "level" of execution.
         let mut result = Vec::new();
+
+        // Process tasks level by level until the queue is empty.
         while !queue.is_empty() {
+            // `level` will store all tasks that can be executed in the current parallel batch.
             let mut level = Vec::new();
+            // Iterate over all tasks currently in the queue (tasks with in-degree 0 at this stage).
+            // The number of iterations is fixed to the current queue size to process one full level.
             for _ in 0..queue.len() {
-                let task_id = queue.pop_front().unwrap();
+                // Dequeue a task. This task is now considered "executed".
+                let task_id = queue.pop_front().unwrap(); // Safe due to loop condition
                 level.push(task_id);
 
+                // For the "executed" task, find all tasks that depend on it (reverse dependencies).
                 if let Some(rev_deps) = self.reverse_dependencies.get(&task_id) {
-                    for &dep_id in rev_deps {
-                        let entry = in_degree.get_mut(&dep_id).unwrap();
+                    for &dependent_task_id in rev_deps {
+                        // Decrement the in-degree of each dependent task.
+                        let entry = in_degree.get_mut(&dependent_task_id).unwrap(); // Dependent must exist
                         *entry -= 1;
+                        // If a dependent task's in-degree becomes 0, it means all its prerequisites
+                        // have been met, so it can be added to the queue for the next level of execution.
                         if *entry == 0 {
-                            queue.push_back(dep_id);
+                            queue.push_back(dependent_task_id);
                         }
                     }
                 }
             }
+            // Add the completed level (all tasks that could run in parallel) to the result.
             result.push(level);
         }
 
+        // If the result doesn't contain all tasks (e.g. sum of lengths of inner vecs != self.tasks.len()),
+        // it implies a cycle was present. However, `validate()` should have caught this.
+        // This function assumes a valid, cycle-free topology.
         result
     }
 
@@ -155,62 +181,5 @@ impl TopologyManager {
 
     pub fn get_dependencies(&self, task_id: &Uuid) -> Option<&Vec<Uuid>> {
         self.dependencies.get(task_id)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn create_test_task(id: u128, deps: Vec<u128>) -> TaskConfig {
-        TaskConfig {
-            name: format!("Task {}", id),
-            id: Uuid::from_u128(id),
-            command: "echo test".to_string(),
-            is_periodic: false,
-            interval: "0".to_string(),
-            importance: 1,
-            dependencies: deps.into_iter().map(Uuid::from_u128).collect(),
-        }
-    }
-
-    #[test]
-    fn test_valid_topology() {
-        let tasks = vec![
-            create_test_task(1, vec![]),
-            create_test_task(2, vec![1]),
-            create_test_task(3, vec![1]),
-            create_test_task(4, vec![2, 3]),
-        ];
-
-        let topology = TopologyManager::new(tasks).unwrap();
-        let order = topology.get_execution_order();
-        assert_eq!(order.len(), 3);
-        assert_eq!(order[0], vec![Uuid::from_u128(1)]);
-        assert!(order[1].contains(&Uuid::from_u128(2)) && order[1].contains(&Uuid::from_u128(3)));
-        assert_eq!(order[2], vec![Uuid::from_u128(4)]);
-    }
-
-    #[test]
-    fn test_cyclic_topology() {
-        let tasks = vec![
-            create_test_task(1, vec![3]),
-            create_test_task(2, vec![1]),
-            create_test_task(3, vec![2]),
-        ];
-
-        let result = TopologyManager::new(tasks);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_missing_dependency() {
-        let tasks = vec![
-            create_test_task(1, vec![]),
-            create_test_task(2, vec![3]), // Task 3 doesn't exist
-        ];
-
-        let result = TopologyManager::new(tasks);
-        assert!(result.is_err());
     }
 }

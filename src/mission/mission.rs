@@ -1,6 +1,7 @@
 use crate::common::types::{MissionConfig, TaskInfo};
 use crate::event::EventSystem;
 use crate::mission::topology::TopologyManager;
+use crate::common::types::DependencyState;
 use crate::task::task::Task;
 use crate::utils::error::{NightError, Result};
 use std::collections::HashMap;
@@ -8,6 +9,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use uuid::Uuid;
 use crate::common::types::TaskStatus;
+use async_recursion::async_recursion;
 
 #[derive(Clone)]
 pub struct Mission {
@@ -60,6 +62,13 @@ impl Mission {
             task.setup_dependency_listeners().await?;
         }
 
+        // After setting up all dependency listeners...
+        println!("Mission: Notifying all tasks to perform initial checks.");
+        for (_, task) in self.tasks.read().await.iter() {
+            task.notify_ready.notify_one();
+        }
+        // The existing code that gets execution_order and iterates through levels to spawn tasks should follow.
+
         let execution_order = self.topology.get_execution_order();
 
         for (level, tasks) in execution_order.iter().enumerate() {
@@ -84,11 +93,14 @@ impl Mission {
                 handles.push(handle);
             }
 
-            for handle in handles {
-                handle
-                    .await
-                    .map_err(|e| NightError::Mission(format!("Task execution failed: {}", e)))??;
-            }
+            // The following loop has been removed as per instructions:
+            // for handle in handles {
+            //     handle
+            //         .await
+            //         .map_err(|e| NightError::Mission(format!("Task execution failed: {}", e)))??;
+            // }
+            // `handles` vector is now populated but its elements are not awaited here.
+            // The spawned tasks will run in the background.
         }
 
         Ok(())
@@ -119,6 +131,7 @@ impl Mission {
     }
     
     // 递归地将所有依赖于指定任务的任务标记为不完整
+    #[async_recursion]
     async fn mark_dependent_tasks_incomplete(&self, task_id: Uuid, visited: &mut std::collections::HashSet<Uuid>) -> Result<()> {
         // 防止循环依赖导致的无限递归
         if visited.contains(&task_id) {
@@ -149,7 +162,7 @@ impl Mission {
                 };
                 
                 // 将依赖状态设置为false，表示依赖未完成
-                dependent_task.set_dependency_status(task_id, false);
+                dependent_task.set_dependency_status(task_id, DependencyState::Pending);
                 println!("Mission: Marked dependency {} as incomplete for task {}", 
                          task_id, dependent_id);
                 
@@ -161,9 +174,8 @@ impl Mission {
             dependent_task_clone.set_status_external(TaskStatus::Pending).await;
             println!("Mission: Stopped dependent task {} ({})", dependent_task_clone.config.name, dependent_id);
             
-            // 递归处理依赖于此依赖任务的任务，使用Box::pin处理递归
-            let future = self.mark_dependent_tasks_incomplete(dependent_id, visited);
-            Box::pin(future).await?
+            // 递归处理依赖于此依赖任务的任务
+            self.mark_dependent_tasks_incomplete(dependent_id, visited).await?;
         }
         
         Ok(())
@@ -198,6 +210,7 @@ impl Mission {
 mod tests {
     use super::*;
     use crate::common::types::{TaskConfig, TaskStatus};
+    use tokio::time::{sleep, Duration}; // Added import
 
     fn create_test_config() -> MissionConfig {
         MissionConfig {
@@ -206,7 +219,7 @@ mod tests {
                 TaskConfig {
                     name: "Task 1".to_string(),
                     id: Uuid::new_v4(),
-                    command: "echo Task 1".to_string(),
+                    command: "echo Task 1".to_string(), // Simple, fast command
                     is_periodic: false,
                     interval: "0".to_string(),
                     importance: 1,
@@ -215,7 +228,7 @@ mod tests {
                 TaskConfig {
                     name: "Task 2".to_string(),
                     id: Uuid::new_v4(),
-                    command: "echo Task 2".to_string(),
+                    command: "echo Task 2".to_string(), // Simple, fast command
                     is_periodic: false,
                     interval: "0".to_string(),
                     importance: 1,
@@ -235,15 +248,33 @@ mod tests {
     #[tokio::test]
     async fn test_mission_execution() {
         let config = create_test_config();
+        let num_tasks = config.tasks.len();
         let mission = Mission::new(config).await.unwrap();
         let result = mission.start().await;
         assert!(result.is_ok());
 
-        // Check if all tasks are completed
-        let task_info = mission.get_all_task_info().await;
-        for (_, info) in task_info {
-            assert_eq!(info.status, TaskStatus::Completed);
+        let max_attempts = 30; // e.g., 30 * 100ms = 3 seconds timeout
+        let mut all_completed = false;
+        for _ in 0..max_attempts {
+            let task_info_map = mission.get_all_task_info().await;
+            let completed_count = task_info_map
+                .values()
+                .filter(|info| info.status == TaskStatus::Completed)
+                .count();
+
+            if completed_count == num_tasks {
+                all_completed = true;
+                break;
+            }
+            sleep(Duration::from_millis(100)).await;
         }
+
+        // Assertions remain the same; they will fail if not all_completed after the loop.
+        let final_task_info = mission.get_all_task_info().await;
+        for (id, info) in final_task_info {
+            assert_eq!(info.status, TaskStatus::Completed, "Task {} did not complete. Status: {:?}", id, info.status);
+        }
+        assert!(all_completed, "Not all tasks completed within the timeout."); // Extra assertion for clarity
     }
 
     #[tokio::test]

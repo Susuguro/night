@@ -1,0 +1,26 @@
+name: YAML Test Mission
+tasks:
+  - name: Task A YAML
+    id: "00000000-0000-0000-0000-0000000000A1"
+    command: "sleep 0.1; echo Task A YAML complete"
+    is_periodic: false
+    interval: "1"
+    importance: 1
+    dependencies: []
+
+  - name: Task B YAML
+    id: "00000000-0000-0000-0000-0000000000B1"
+    command: "sleep 0.1; echo Task B YAML complete"
+    is_periodic: false
+    interval: "1"
+    importance: 1
+    dependencies:
+      - "00000000-0000-0000-0000-0000000000A1"
+
+  - name: Task C YAML
+    id: "00000000-0000-0000-0000-0000000000C1"
+    command: "sleep 0.1; echo Task C YAML complete"
+    is_periodic: false
+    interval: "1"
+    importance: 1
+    dependencies: []

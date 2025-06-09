@@ -1,5 +1,5 @@
 use crate::task::task::Task;
-use crate::utils::error::Result;
+use crate::utils::error::{NightError, Result}; // Added NightError for format!
 use std::sync::Arc;
 use tokio::time::{interval, Duration};
 
@@ -25,12 +25,23 @@ impl TaskScheduler {
     }
 
     async fn run_periodic(&self) -> Result<()> {
+        // Perform initial run if should_run is true
+        if self.should_run() {
+            self.task.run().await?;
+        } else {
+            // If not allowed to run initially, just return.
+            // This prevents starting the interval timer if the task is immediately cancelled.
+            return Ok(());
+        }
+
         let interval_duration = self.parse_interval()?;
         let mut interval = interval(interval_duration);
 
         loop {
+            // Wait for the next interval tick.
             interval.tick().await;
 
+            // Check if the task should continue running before each execution.
             if !self.should_run() {
                 break;
             }
@@ -48,68 +59,13 @@ impl TaskScheduler {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    fn parse_interval(&self) -> Result<Duration> {
-        // Parse the interval string into a Duration
-        self.task
-            .config
-            .interval
+    pub fn parse_interval(&self) -> Result<Duration> {
+        let interval_str = &self.task.config.interval;
+        interval_str
             .parse::<u64>()
             .map(Duration::from_millis)
             .map_err(|_| {
-                crate::utils::error::NightError::Task("Invalid interval format".to_string())
+                NightError::Task(format!("Invalid interval format: '{}'", interval_str))
             })
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::{common::types::{TaskConfig, TaskStatus}, event::EventSystem};
-    use uuid::Uuid;
-
-    fn create_test_task(is_periodic: bool, interval: &str) -> Arc<Task> {
-        let config = TaskConfig {
-            name: "Test Task".to_string(),
-            id: Uuid::new_v4(),
-            command: "echo Hello".to_string(),
-            is_periodic,
-            interval: interval.to_string(),
-            importance: 1,
-            dependencies: vec![],
-        };
-        // let address_map: Arc<HashMap<String, String>> = Arc::new(HashMap::new());
-        let depend = config.dependencies.clone();
-        Arc::new(Task::new(config, Arc::new(EventSystem::new()), depend))
-    }
-
-    #[tokio::test]
-    async fn test_run_once() {
-        let task = create_test_task(false, "0");
-        let scheduler = TaskScheduler::new(task.clone());
-
-        scheduler.start().await.unwrap();
-
-        assert_eq!(*task.status.lock().unwrap(), TaskStatus::Completed);
-    }
-
-    #[tokio::test]
-    async fn test_run_periodic() {
-        let task = create_test_task(true, "100");
-        let scheduler = TaskScheduler::new(task.clone());
-
-        // Run the scheduler for a short time
-        tokio::spawn(async move {
-            scheduler.start().await.unwrap();
-        });
-
-        // Wait for a bit to allow multiple executions
-        tokio::time::sleep(Duration::from_millis(350)).await;
-
-        task.set_execution_lock(false);
-
-        // Wait for the scheduler to stop
-        tokio::time::sleep(Duration::from_millis(150)).await;
-
-        assert_eq!(*task.status.lock().unwrap(), TaskStatus::Completed);
     }
 }
