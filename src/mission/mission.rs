@@ -92,11 +92,14 @@ impl Mission {
                 handles.push(handle);
             }
 
-            for handle in handles {
-                handle
-                    .await
-                    .map_err(|e| NightError::Mission(format!("Task execution failed: {}", e)))??;
-            }
+            // The following loop has been removed as per instructions:
+            // for handle in handles {
+            //     handle
+            //         .await
+            //         .map_err(|e| NightError::Mission(format!("Task execution failed: {}", e)))??;
+            // }
+            // `handles` vector is now populated but its elements are not awaited here.
+            // The spawned tasks will run in the background.
         }
 
         Ok(())
@@ -206,6 +209,7 @@ impl Mission {
 mod tests {
     use super::*;
     use crate::common::types::{TaskConfig, TaskStatus};
+    use tokio::time::{sleep, Duration}; // Added import
 
     fn create_test_config() -> MissionConfig {
         MissionConfig {
@@ -214,7 +218,7 @@ mod tests {
                 TaskConfig {
                     name: "Task 1".to_string(),
                     id: Uuid::new_v4(),
-                    command: "echo Task 1".to_string(),
+                    command: "echo Task 1".to_string(), // Simple, fast command
                     is_periodic: false,
                     interval: "0".to_string(),
                     importance: 1,
@@ -223,7 +227,7 @@ mod tests {
                 TaskConfig {
                     name: "Task 2".to_string(),
                     id: Uuid::new_v4(),
-                    command: "echo Task 2".to_string(),
+                    command: "echo Task 2".to_string(), // Simple, fast command
                     is_periodic: false,
                     interval: "0".to_string(),
                     importance: 1,
@@ -243,15 +247,33 @@ mod tests {
     #[tokio::test]
     async fn test_mission_execution() {
         let config = create_test_config();
+        let num_tasks = config.tasks.len();
         let mission = Mission::new(config).await.unwrap();
         let result = mission.start().await;
         assert!(result.is_ok());
 
-        // Check if all tasks are completed
-        let task_info = mission.get_all_task_info().await;
-        for (_, info) in task_info {
-            assert_eq!(info.status, TaskStatus::Completed);
+        let max_attempts = 30; // e.g., 30 * 100ms = 3 seconds timeout
+        let mut all_completed = false;
+        for _ in 0..max_attempts {
+            let task_info_map = mission.get_all_task_info().await;
+            let completed_count = task_info_map
+                .values()
+                .filter(|info| info.status == TaskStatus::Completed)
+                .count();
+
+            if completed_count == num_tasks {
+                all_completed = true;
+                break;
+            }
+            sleep(Duration::from_millis(100)).await;
         }
+
+        // Assertions remain the same; they will fail if not all_completed after the loop.
+        let final_task_info = mission.get_all_task_info().await;
+        for (id, info) in final_task_info {
+            assert_eq!(info.status, TaskStatus::Completed, "Task {} did not complete. Status: {:?}", id, info.status);
+        }
+        assert!(all_completed, "Not all tasks completed within the timeout."); // Extra assertion for clarity
     }
 
     #[tokio::test]
