@@ -103,7 +103,7 @@ Refer to the project documentation or examples for the detailed configuration sc
 ## Building from Source
 
 1.  Ensure you have Rust and Cargo installed (see [rustup.rs](https://rustup.rs/)).
-2.  Clone the repository: `git clone https://github.com/your-username/night.git`
+2.  Clone the repository
 3.  Navigate to the project directory: `cd night`
 4.  Build the project: `cargo build --release`
 5.  The executable will be located at `target/release/night`.
